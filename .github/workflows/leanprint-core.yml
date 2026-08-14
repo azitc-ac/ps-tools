@@ -1,0 +1,34 @@
+name: LeanPrint Core CI
+
+# Builds and tests the platform-neutral LeanPrint core (imposition engine).
+# Runs on Linux since the core has no Windows dependencies.
+
+on:
+  push:
+    paths:
+      - 'leanprint/**'
+      - '.github/workflows/leanprint-core.yml'
+  pull_request:
+    paths:
+      - 'leanprint/**'
+      - '.github/workflows/leanprint-core.yml'
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore leanprint/LeanPrint.sln
+
+      - name: Build
+        run: dotnet build leanprint/LeanPrint.sln --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test leanprint/LeanPrint.sln --configuration Release --no-build
