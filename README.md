@@ -1,6 +1,7 @@
-# ps-unblock-files
+# ps-tools
 
-Zwei PowerShell-Werkzeuge mit WinForms-Oberfläche:
+Kleine Windows-Werkzeuge für den Alltag. Aktuell zwei PowerShell-Skripte mit
+WinForms-Oberfläche:
 
 | Skript | Zweck |
 |---|---|
