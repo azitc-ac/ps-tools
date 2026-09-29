@@ -264,3 +264,6 @@ Pause. Zur Gegenprobe wird absichtlich mit falschem Layout getippt – das muss
 den Text verfälschen. Dauer etwa 30 s, währenddessen Maus und Tastatur nicht
 benutzen. Exitcode 2: übersprungen, weil die Sitzung gesperrt oder das
 RDP-Fenster minimiert ist.
+
+Test in einer echten **VMware-Konsole** (Alpine-VM in Workstation Pro mit
+Prüfskript im Gast): siehe [`tests/vmconsole/README.md`](tests/vmconsole/README.md).
