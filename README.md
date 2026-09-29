@@ -180,7 +180,7 @@ Der Exitcode des Uninstallers landet als Status in der Liste:
 
 ## TextCopyHelper.ps1
 
-Version 8.0 (Nachfolger von `TextCopyHelper-v7.ps1`). Liest beim Start das Clipboard und zeigt jede Zeile in einem eigenen Feld mit
+Version 8.1 (Nachfolger von `TextCopyHelper-v7.ps1`). Liest beim Start das Clipboard und zeigt jede Zeile in einem eigenen Feld mit
 **Copy**-Knopf – praktisch, um Benutzername, Kennwort, Pfade o. Ä. einzeln in
 Anwendungen zu übertragen.
 

@@ -105,12 +105,36 @@ public static class KeyTyper
     public static bool UnloadLayout(IntPtr hkl) { return UnloadKeyboardLayout(hkl); }
 
     // ── Zeichen → Taste ──────────────────────────────────────────────────────
+    // VkKeyScanEx findet manche Zeichen nicht, obwohl sie auf dem Layout liegen
+    // (z. B. „€" = AltGr+E auf DE). Dann alle Tasten × {ohne, Shift, AltGr, Shift+AltGr} abfragen.
+    private static bool SearchLayout(char ch, IntPtr hkl, out uint vkOut, out int shOut) {
+        int[] states = { 0, 1, 6, 7 };           // Bits wie VkKeyScan: 1 = Shift, 2 = Ctrl, 4 = Alt
+        byte[] ks = new byte[256];
+        StringBuilder buf = new StringBuilder(8);
+        foreach (int s in states) {
+            for (uint vk = 1; vk < 0xFF; vk++) {
+                uint sc = MapVirtualKeyExW(vk, 0, hkl);   // MAPVK_VK_TO_VSC
+                if (sc == 0) continue;
+                Array.Clear(ks, 0, ks.Length);
+                if ((s & 1) != 0) ks[VK_SHIFT]   = 0x80;
+                if ((s & 2) != 0) ks[VK_CONTROL] = 0x80;
+                if ((s & 4) != 0) ks[VK_MENU]    = 0x80;
+                buf.Length = 0;
+                if (ToUnicodeEx(vk, sc, ks, buf, buf.Capacity, 4, hkl) == 1 && buf[0] == ch) {
+                    vkOut = vk; shOut = s; return true;
+                }
+            }
+        }
+        vkOut = 0; shOut = 0;
+        return false;
+    }
+
     public static bool TryPlan(char ch, IntPtr hkl, out KeyPlan p) {
         p = new KeyPlan();
+        uint vk; int sh;
         short r = VkKeyScanExW(ch, hkl);
-        if (r == -1) return false;
-        uint vk = (uint)(r & 0xFF);
-        int  sh = (r >> 8) & 0xFF;
+        if (r != -1) { vk = (uint)(r & 0xFF); sh = (r >> 8) & 0xFF; }
+        else if (!SearchLayout(ch, hkl, out vk, out sh)) return false;
         if ((sh & 0x38) != 0) return false;          // Hankaku/Kana-Zustände: nicht unterstützt
         p.Shift = (sh & 1) != 0;
         p.Ctrl  = (sh & 2) != 0;
@@ -458,7 +482,7 @@ $FORM_WIDTH     = 520
 $PREVIEW_HEIGHT = 130    # Vorschau-Bereich (Label + RTF-Box), per Splitter verstellbar
 $LOG_HEIGHT     = 80
 
-$VERSION        = "8.0"
+$VERSION        = "8.1"
 
 # Tippen („Paste clipboard as keyboard input")
 $TYPE_START_S   = 2      # Wartezeit nach dem Minimieren, um ins Zielfenster zu wechseln

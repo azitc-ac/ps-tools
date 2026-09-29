@@ -95,6 +95,8 @@ Check "US '[' = eigene Taste ohne Modifier" ([KeyTyper]::TryPlan('[', $us, [ref]
 Check "DE '^' ist Tottaste"  ([KeyTyper]::TryPlan('^', $de, [ref]$p) -and $p.Dead)
 Check "DE '°' (Shift+^) ist keine Tottaste" ([KeyTyper]::TryPlan([char]0xB0, $de, [ref]$p) -and $p.Shift -and -not $p.Dead)
 Check "DE '´' ist Tottaste"  ([KeyTyper]::TryPlan([char]0xB4, $de, [ref]$p) -and $p.Dead)
+Check "DE '€' = AltGr+E (VkKeyScanEx kennt es nicht)" ([KeyTyper]::TryPlan([char]0x20AC, $de, [ref]$p) -and $p.Ctrl -and $p.Alt -and -not $p.Shift -and $p.Scan -eq 0x12)
+Check "DE 'µ' = AltGr+M" ([KeyTyper]::TryPlan([char]0xB5, $de, [ref]$p) -and $p.Alt -and $p.Scan -eq 0x32)
 Check "US 'ä' fehlt im Layout" (-not [KeyTyper]::TryPlan([char]0xE4, $us, [ref]$p))
 
 # Nicht installiertes Layout: nur laden, danach wieder entladen
@@ -123,7 +125,7 @@ Write-Host "Tippen, Layout Auto, 0 ms"
 $run = Invoke-TypingRun $sample 'auto' 0
 Check "alles angekommen ($($sample.Length) Zeichen, $($run.Layout))" ($run.Received -ceq $sample) (Show-Diff $sample $run.Received)
 Check "kein Abbruch" (-not $run.Result.Aborted) $run.Result.Aborted
-Check "keine Unicode-Ersatzzeichen" ($run.Result.Unicode -eq 0) $run.Result.Missing
+Check "keine Unicode-Ersatzzeichen" ($run.Result.Unicode -eq 0) (($run.Result.Missing.ToCharArray() | ForEach-Object { 'U+{0:X4}' -f [int]$_ }) -join ' ')
 
 Write-Host "Tippen, Layout Auto, 20 ms (Modifier mit Pause)"
 $short = "Shift+AltGr: `$ [ ] { } \ | @ ~ € ° § & / ( ) = ? `" ' * + #`r`n"
