@@ -67,6 +67,23 @@ Für das große Muster mit allen 94 druckbaren ASCII-Zeichen in Schritt 1
 Fällt #4 nicht durch, ist der Test nicht trennscharf. Dann stimmt etwas am
 Aufbau nicht, z. B. hat der Gast doch US-Layout.
 
+## Kommt nichts an? Test ohne Fokuswechsel
+
+Mit dem Klick auf den Knopf in TextCopyHelper verliert Workstation den Fokus und
+damit die Eingabe-Übernahme. `grabbed-typing-test.cmd` (Doppelklick) trennt die
+beiden möglichen Ursachen:
+
+1. Im Gast `sh /mnt/check.sh pw` starten.
+2. `tests\vmconsole\grabbed-typing-test.cmd` doppelklicken.
+3. Während des Countdowns (8 s) in die VM-Konsole klicken, dann nichts anfassen.
+4. Wenn das Skript `Getippt: 22 von 22` meldet, im Gast Enter drücken.
+
+Tippt nur, wenn vorn ein Fenster mit „VMware“ im Titel ist. Danach lässt sich
+direkt ein weiterer Durchlauf mit anderem Delay starten.
+
+- `OK` → Ursache ist die verlorene Übernahme, das lässt sich im Tool lösen.
+- wieder `0 bekommen` → Workstation verwirft eingespeiste Tasten grundsätzlich.
+
 ## Aufräumen
 
 ```powershell
