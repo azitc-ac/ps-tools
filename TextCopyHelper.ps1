@@ -4,12 +4,20 @@ Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # ========== Native SendInput (Keyboard / Scancode) ==========
-if (-not ('ScanInput' -as [type])) {
+# Tippt Text als Scancodes — nötig für Konsolen, VMs und Remote-Sitzungen, die kein Einfügen kennen.
+# Das Layout für die Zuordnung Zeichen → Taste kommt vom ZIELFENSTER (oder wird fest gewählt),
+# nicht vom eigenen Thread: sonst kommt z. B. „[" (DE: AltGr+8) in einem US-Ziel als „8" an.
+# Modifier gehen gebündelt runter, dann Pause, dann die Taste — manche VM-/Remote-Konsolen
+# verlieren Shift/AltGr, wenn Modifier und Taste im selben Augenblick eintreffen.
+if (-not ('KeyTyper' -as [type])) {
 Add-Type -Language CSharp @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 
-public static class ScanInput
+public static class KeyTyper
 {
     [StructLayout(LayoutKind.Sequential)]
     public struct INPUT { public uint type; public InputUnion U; }
@@ -30,94 +38,179 @@ public static class ScanInput
     [StructLayout(LayoutKind.Sequential)]
     public struct HARDWAREINPUT { public uint uMsg; public ushort wParamL, wParamH; }
 
+    public struct KeyPlan { public ushort Scan; public bool Ext, Shift, Ctrl, Alt, Dead; }
+
+    public class TypeResult {
+        public int Typed;          // gesendete Zeichen
+        public int Unicode;        // davon als Unicode-Paket (Zeichen fehlt im Layout)
+        public string Missing = ""; // welche Zeichen das waren
+        public string Aborted = ""; // leer = vollständig
+    }
+
     private const uint INPUT_KEYBOARD        = 1;
-    private const uint KEYEVENTF_SCANCODE    = 0x0008;
-    private const uint KEYEVENTF_KEYUP       = 0x0002;
     private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
-    private const uint MAPVK_VK_TO_VSC_EX    = 0x04;
+    private const uint KEYEVENTF_KEYUP       = 0x0002;
+    private const uint KEYEVENTF_UNICODE     = 0x0004;
+    private const uint KEYEVENTF_SCANCODE    = 0x0008;
+    private const uint MAPVK_VK_TO_VSC_EX    = 4;
+    private const int  VK_SHIFT              = 0x10;
+    private const int  VK_CONTROL            = 0x11;
+    private const int  VK_MENU               = 0x12;
+    private const uint KLF_NOTELLSHELL       = 0x0080;
+    private const int  VK_ESCAPE             = 0x1B;
 
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-    [DllImport("user32.dll")]
-    private static extern short VkKeyScanExW(char ch, IntPtr dwhkl);
-    [DllImport("user32.dll")]
-    private static extern uint MapVirtualKeyEx(uint code, uint mapType, IntPtr dwhkl);
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetKeyboardLayout(uint threadId);
+    private const ushort SC_LCTRL  = 0x1D;
+    private const ushort SC_LSHIFT = 0x2A;
+    private const ushort SC_ALT    = 0x38;   // mit Extended-Flag = rechte Alt-Taste (AltGr)
+    private const ushort SC_SPACE  = 0x39;
 
-    public static bool TryGetScanAndMods(
-        char ch, out ushort scan, out bool needShift, out bool needLCtrl,
-        out bool needRAltExt, out bool ext, out bool isDeadKey)
-    {
-        scan = 0; needShift = false; needLCtrl = false;
-        needRAltExt = false; ext = false; isDeadKey = false;
+    [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+    [DllImport("user32.dll")] private static extern short VkKeyScanExW(char ch, IntPtr hkl);
+    [DllImport("user32.dll")] private static extern uint MapVirtualKeyExW(uint code, uint mapType, IntPtr hkl);
+    [DllImport("user32.dll")] private static extern IntPtr GetKeyboardLayout(uint threadId);
+    [DllImport("user32.dll")] private static extern int GetKeyboardLayoutList(int n, [Out] IntPtr[] list);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr LoadKeyboardLayoutW(string klid, uint flags);
+    [DllImport("user32.dll")] private static extern bool UnloadKeyboardLayout(IntPtr hkl);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowTextW(IntPtr hwnd, StringBuilder sb, int max);
+    [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vk);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int ToUnicodeEx(uint vk, uint scan, byte[] keyState, StringBuilder buf, int bufSize, uint flags, IntPtr hkl);
 
-        IntPtr hkl = GetKeyboardLayout(0);
-        short result = VkKeyScanExW(ch, hkl);
-        if (result == -1) return false;
+    // ── Fenster / Layouts ────────────────────────────────────────────────────
+    public static IntPtr ForegroundWindow() { return GetForegroundWindow(); }
 
-        byte vk = (byte)(result & 0xFF);
-        byte sh = (byte)((result >> 8) & 0xFF);
-        needShift = (sh & 1) != 0;
-        bool ctrl = (sh & 2) != 0;
-        bool alt  = (sh & 4) != 0;
-        needLCtrl   = ctrl || alt;
-        needRAltExt = alt;
+    public static IntPtr LayoutOfWindow(IntPtr hwnd) {
+        uint pid;
+        uint tid = GetWindowThreadProcessId(hwnd, out pid);
+        return GetKeyboardLayout(tid);
+    }
 
-        uint scEx = MapVirtualKeyEx(vk, MAPVK_VK_TO_VSC_EX, hkl);
-        if (scEx == 0) return false;
+    public static string WindowTitle(IntPtr hwnd) {
+        StringBuilder sb = new StringBuilder(256);
+        GetWindowTextW(hwnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
 
-        ext  = (scEx & 0x100) != 0;
-        scan = (ushort)(scEx & 0xFF);
-        if (ch == '^' || ch == '`') isDeadKey = true;
+    public static IntPtr[] InstalledLayouts() {
+        int n = GetKeyboardLayoutList(0, null);
+        IntPtr[] list = new IntPtr[n];
+        GetKeyboardLayoutList(n, list);
+        return list;
+    }
+
+    // Lädt ein nicht installiertes Layout nur zum Nachschlagen (ohne Aktivierung, ohne Shell-Meldung).
+    public static IntPtr LoadLayout(string klid) { return LoadKeyboardLayoutW(klid, KLF_NOTELLSHELL); }
+    public static bool UnloadLayout(IntPtr hkl) { return UnloadKeyboardLayout(hkl); }
+
+    // ── Zeichen → Taste ──────────────────────────────────────────────────────
+    public static bool TryPlan(char ch, IntPtr hkl, out KeyPlan p) {
+        p = new KeyPlan();
+        short r = VkKeyScanExW(ch, hkl);
+        if (r == -1) return false;
+        uint vk = (uint)(r & 0xFF);
+        int  sh = (r >> 8) & 0xFF;
+        if ((sh & 0x38) != 0) return false;          // Hankaku/Kana-Zustände: nicht unterstützt
+        p.Shift = (sh & 1) != 0;
+        p.Ctrl  = (sh & 2) != 0;
+        p.Alt   = (sh & 4) != 0;
+
+        uint sc = MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, hkl);
+        if (sc == 0) return false;
+        p.Scan = (ushort)(sc & 0xFF);
+        p.Ext  = (sc & 0xFF00) == 0xE000 || (sc & 0xFF00) == 0xE100;   // Präfix E0/E1
+
+        // Tottaste? (^ ´ ` bei DE, ' " ~ bei US-International …) — hängt vom Umschaltzustand ab:
+        // DE „^" ist tot, „°" (Shift+^) nicht. ToUnicodeEx < 0 = tot; Flag 4 = Tastaturzustand nicht verändern.
+        byte[] ks = new byte[256];
+        if (p.Shift) ks[VK_SHIFT]   = 0x80;
+        if (p.Ctrl)  ks[VK_CONTROL] = 0x80;
+        if (p.Alt)   ks[VK_MENU]    = 0x80;
+        StringBuilder buf = new StringBuilder(8);
+        p.Dead = ToUnicodeEx(vk, sc & 0xFF, ks, buf, buf.Capacity, 4, hkl) < 0;
         return true;
     }
 
-    private static void SendKey(ushort scan, bool ext, bool up)
-    {
-        INPUT[] inp = new INPUT[1];
-        inp[0].type = INPUT_KEYBOARD;
-        inp[0].U.ki.wVk = 0;
-        inp[0].U.ki.wScan = scan;
-        uint flags = KEYEVENTF_SCANCODE;
-        if (ext) flags |= KEYEVENTF_EXTENDEDKEY;
-        if (up)  flags |= KEYEVENTF_KEYUP;
-        inp[0].U.ki.dwFlags = flags;
-        inp[0].U.ki.time = 0;
-        inp[0].U.ki.dwExtraInfo = IntPtr.Zero;
-        uint sent = SendInput(1, inp, Marshal.SizeOf(typeof(INPUT)));
-        if (sent == 0)
+    private static INPUT Key(ushort scan, bool ext, bool up) {
+        INPUT i = new INPUT();
+        i.type = INPUT_KEYBOARD;
+        i.U.ki.wScan = scan;
+        i.U.ki.dwFlags = KEYEVENTF_SCANCODE | (ext ? KEYEVENTF_EXTENDEDKEY : 0) | (up ? KEYEVENTF_KEYUP : 0);
+        return i;
+    }
+
+    private static INPUT Uni(char ch, bool up) {
+        INPUT i = new INPUT();
+        i.type = INPUT_KEYBOARD;
+        i.U.ki.wScan = ch;
+        i.U.ki.dwFlags = KEYEVENTF_UNICODE | (up ? KEYEVENTF_KEYUP : 0);
+        return i;
+    }
+
+    private static void Send(params INPUT[] inputs) {
+        uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+        if (sent != inputs.Length)
             throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
     }
 
-    public static void ModDown_LCtrl()  { SendKey(0x1D, false, false); }
-    public static void ModUp_LCtrl()    { SendKey(0x1D, false, true);  }
-    public static void ModDown_LShift() { SendKey(0x2A, false, false); }
-    public static void ModUp_LShift()   { SendKey(0x2A, false, true);  }
-    public static void ModDown_RAlt()   { SendKey(0x38, true,  false); }
-    public static void ModUp_RAlt()     { SendKey(0x38, true,  true);  }
+    private static void Pause(int ms) { if (ms > 0) Thread.Sleep(ms); }
 
-    public static void SendCharByScan(char ch, int delayMs)
-    {
-        ushort scan;
-        bool needShift, needLCtrl, needRAltExt, ext, isDeadKey;
-        if (!TryGetScanAndMods(ch, out scan, out needShift, out needLCtrl, out needRAltExt, out ext, out isDeadKey))
-            throw new InvalidOperationException("Char not representable in current layout: " + ch);
-
-        if (needLCtrl)   ModDown_LCtrl();
-        if (needRAltExt) ModDown_RAlt();
-        if (needShift)   ModDown_LShift();
-
-        if (isDeadKey) {
-            SendKey(scan, ext, false); SendKey(scan, ext, true);
-            SendKey(0x39, false, false); SendKey(0x39, false, true);
-        } else {
-            SendKey(scan, ext, false); SendKey(scan, ext, true);
+    // Liefert false, wenn das Zeichen im Layout fehlt und als Unicode-Paket ging
+    // (funktioniert in lokalen Programmen, in VM-Konsolen meist nicht).
+    public static bool TypeChar(char ch, IntPtr hkl, int delayMs) {
+        KeyPlan p;
+        if (!TryPlan(ch, hkl, out p)) {
+            Send(Uni(ch, false), Uni(ch, true));
+            Pause(delayMs);
+            return false;
         }
 
-        if (needShift)   ModUp_LShift();
-        if (needRAltExt) ModUp_RAlt();
-        if (needLCtrl)   ModUp_LCtrl();
+        List<INPUT> down = new List<INPUT>();
+        List<INPUT> up   = new List<INPUT>();
+        if (p.Ctrl || p.Alt) { down.Add(Key(SC_LCTRL, false, false)); up.Insert(0, Key(SC_LCTRL, false, true)); }
+        if (p.Alt)           { down.Add(Key(SC_ALT, true, false));    up.Insert(0, Key(SC_ALT, true, true)); }
+        if (p.Shift)         { down.Add(Key(SC_LSHIFT, false, false)); up.Insert(0, Key(SC_LSHIFT, false, true)); }
+
+        try {
+            if (down.Count > 0) { Send(down.ToArray()); Pause(delayMs); }
+            Send(Key(p.Scan, p.Ext, false), Key(p.Scan, p.Ext, true));
+            if (down.Count > 0) Pause(delayMs);
+        } finally {
+            // Modifier IMMER loslassen — sonst hängt Shift/AltGr nach einem Fehler fest
+            if (up.Count > 0) Send(up.ToArray());
+        }
+        if (p.Dead) {
+            // Tottaste + Leertaste = das Zeichen selbst
+            Pause(delayMs);
+            Send(Key(SC_SPACE, false, false), Key(SC_SPACE, false, true));
+        }
+        Pause(delayMs);
+        return true;
+    }
+
+    // Tippt den Text. Bricht ab, wenn das Vordergrundfenster wechselt oder Esc gedrückt wird.
+    public static TypeResult TypeText(string text, IntPtr hkl, int delayMs, IntPtr expectedWindow) {
+        TypeResult res = new TypeResult();
+        string t = text.Replace("\r\n", "\r").Replace("\n", "\r");
+        GetAsyncKeyState(VK_ESCAPE);                         // „seit letztem Aufruf gedrückt" zurücksetzen
+        StringBuilder missing = new StringBuilder();
+
+        foreach (char c in t) {
+            if (expectedWindow != IntPtr.Zero && GetForegroundWindow() != expectedWindow) {
+                res.Aborted = "target window lost focus"; break;
+            }
+            if ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0) { res.Aborted = "Esc pressed"; break; }
+            if (c < 0x20 && c != '\r' && c != '\t' && c != '\b') continue;   // übrige Steuerzeichen nicht tippen
+
+            if (!TypeChar(c, hkl, delayMs)) {
+                res.Unicode++;
+                if (missing.ToString().IndexOf(c) < 0) missing.Append(c);
+            }
+            res.Typed++;
+        }
+        res.Missing = missing.ToString();
+        return res;
     }
 }
 '@
@@ -274,28 +367,6 @@ function Get-ClipboardFormat {
     return $result
 }
 
-# ========== Keyboard helpers ==========
-function Type-Char {
-    param([Parameter(Mandatory=$true)][char]$Char, [int]$DelayMs = 15)
-    [ScanInput]::SendCharByScan($Char, $DelayMs)
-    if ($DelayMs -gt 0) { Start-Sleep -Milliseconds $DelayMs }
-}
-
-function Type-ScancodeText {
-    param([Parameter(Mandatory=$true)][string]$Text, [int]$DelayMs = 15)
-    if ([string]::IsNullOrEmpty($Text)) { return }
-
-    $normalized = $Text -replace "`r`n","`n" -replace "`r","`n"
-    foreach ($c in $normalized.ToCharArray()) {
-        switch ($c) {
-            "`n" { [ScanInput]::SendCharByScan([char]0x0D, $DelayMs); if ($DelayMs -gt 0) { Start-Sleep -Milliseconds $DelayMs }; continue }
-            "`t" { [ScanInput]::SendCharByScan([char]0x09, $DelayMs); if ($DelayMs -gt 0) { Start-Sleep -Milliseconds $DelayMs }; continue }
-            "`b" { [ScanInput]::SendCharByScan([char]0x08, $DelayMs); if ($DelayMs -gt 0) { Start-Sleep -Milliseconds $DelayMs }; continue }
-            default { Type-Char -Char $c -DelayMs $DelayMs }
-        }
-    }
-}
-
 # ========== HTML-Hilfsfunktionen ==========
 
 function New-CfHtml {
@@ -387,7 +458,90 @@ $FORM_WIDTH     = 520
 $PREVIEW_HEIGHT = 130    # Vorschau-Bereich (Label + RTF-Box), per Splitter verstellbar
 $LOG_HEIGHT     = 80
 
+$VERSION        = "8.0"
+
+# Tippen („Paste clipboard as keyboard input")
+$TYPE_START_S   = 2      # Wartezeit nach dem Minimieren, um ins Zielfenster zu wechseln
+$TYPE_DELAY_MS  = 15     # Standard: Pause zwischen Zeichen bzw. zwischen Modifier und Taste
+$TYPE_DELAY_MAX = 500
+# Häufige Ziel-Layouts (KLID), auch wenn lokal nicht installiert — für VM-/Remote-Konsolen,
+# deren Layout Windows nicht kennt. Namen kommen aus der Registry.
+$COMMON_KLIDS   = @('00000407', '00000807', '00000409', '00020409', '00000809', '0000040C', '0000080C', '00000410', '0000040A')
+
+# Einstellungen (Layout-Auswahl, Verzögerung) — Tests setzen $TextCopyHelperRegPath auf einen eigenen Schlüssel
+$REG_PATH = if ($TextCopyHelperRegPath) { $TextCopyHelperRegPath } else { 'HKCU:\Software\ps-tools\TextCopyHelper' }
+
 $script:ui = $null
+
+function Get-Setting([string]$Name, $Default) {
+    try {
+        $v = (Get-ItemProperty -Path $REG_PATH -Name $Name -ErrorAction Stop).$Name
+        if ($null -ne $v) { return $v }
+    } catch { }
+    return $Default
+}
+
+function Set-Setting([string]$Name, $Value) {
+    try {
+        if (-not (Test-Path $REG_PATH)) { New-Item -Path $REG_PATH -Force | Out-Null }
+        Set-ItemProperty -Path $REG_PATH -Name $Name -Value $Value
+    } catch { Write-UiLog "Could not save setting ${Name}: $($_.Exception.Message)" }
+}
+
+function Get-KlidName([string]$Klid) {
+    try {
+        $p = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Keyboard Layouts\$Klid" -ErrorAction Stop
+        if ($p.'Layout Text') { return $p.'Layout Text' }
+    } catch { }
+    return "Layout $Klid"
+}
+
+function Get-HklName([IntPtr]$Hkl) {
+    $v    = $Hkl.ToInt64() -band 0xFFFFFFFF
+    $lang = $v -band 0xFFFF
+    $dev  = ($v -shr 16) -band 0xFFFF
+    $culture = try { [Globalization.CultureInfo]::GetCultureInfo([int]$lang).Name } catch { '{0:X4}' -f $lang }
+    if ($dev -eq $lang -or $dev -eq 0) { return "$(Get-KlidName ('{0:X8}' -f $lang)) ($culture)" }
+    return "$culture ({0:X8})" -f $v
+}
+
+function Get-LayoutChoices {
+    # Einträge für die Auswahlliste: Key wird so in der Registry gespeichert.
+    $choices = @([pscustomobject]@{ Key = 'auto'; Name = 'Auto (target window)' })
+    $installedKlids = @()
+    foreach ($h in [KeyTyper]::InstalledLayouts()) {
+        $v = $h.ToInt64() -band 0xFFFFFFFF
+        $choices += [pscustomobject]@{ Key = ('hkl:{0:X8}' -f $v); Name = (Get-HklName $h) }
+        if ((($v -shr 16) -band 0xFFFF) -eq ($v -band 0xFFFF)) { $installedKlids += ('{0:X8}' -f ($v -band 0xFFFF)) }
+    }
+    foreach ($k in $COMMON_KLIDS) {
+        if ($installedKlids -notcontains $k) {
+            $choices += [pscustomobject]@{ Key = "klid:$k"; Name = "$(Get-KlidName $k) (not installed)" }
+        }
+    }
+    return ,$choices
+}
+
+function Resolve-TypingLayout {
+    # Liefert @{ Hkl; Name; Unload } für den gewählten Eintrag.
+    # Unload = true, wenn das Layout nur zum Tippen geladen wurde und danach wieder weg soll.
+    param([string]$Key, [IntPtr]$TargetWindow)
+    if ($Key -like 'hkl:*') {
+        $h = [IntPtr][int64][Convert]::ToUInt32($Key.Substring(4), 16)
+        return @{ Hkl = $h; Name = (Get-HklName $h); Unload = $false }
+    }
+    if ($Key -like 'klid:*') {
+        $klid   = $Key.Substring(5)
+        $before = @([KeyTyper]::InstalledLayouts() | ForEach-Object { $_.ToInt64() })
+        $h      = [KeyTyper]::LoadLayout($klid)
+        if ($h -ne [IntPtr]::Zero) {
+            return @{ Hkl = $h; Name = (Get-KlidName $klid); Unload = ($before -notcontains $h.ToInt64()) }
+        }
+        Write-UiLog "Layout $klid could not be loaded - using the target window's layout."
+    }
+    $h = [KeyTyper]::LayoutOfWindow($TargetWindow)
+    return @{ Hkl = $h; Name = "$(Get-HklName $h), from target window"; Unload = $false }
+}
 
 function Write-UiLog([string]$Message) {
     $script:ui.Log.AppendText("$Message`r`n")
@@ -533,16 +687,27 @@ function Invoke-TypeClipboard {
     catch { Write-UiLog "Failed to read clipboard: $($_.Exception.Message)"; return }
     if ([string]::IsNullOrEmpty($clipText)) { Write-UiLog "Clipboard is empty. Nothing to type."; return }
 
-    Write-UiLog "Typing $($clipText.Length) chars in 2 s: $(Format-Short $clipText)"
+    $delay = [int]$script:ui.DelayBox.Value
+    $key   = $script:ui.LayoutBox.SelectedItem.Key
+    Write-UiLog "Typing $($clipText.Length) chars in $TYPE_START_S s - switch to the target window (Esc aborts): $(Format-Short $clipText)"
     $form.WindowState = 'Minimized'
     [System.Windows.Forms.Application]::DoEvents()
+    $layout = $null
     try {
-        Start-Sleep -Seconds 2
-        Type-ScancodeText -Text $clipText
-        Write-UiLog "Done typing."
+        Start-Sleep -Seconds $TYPE_START_S
+        $target = [KeyTyper]::ForegroundWindow()
+        $layout = Resolve-TypingLayout -Key $key -TargetWindow $target
+        Write-UiLog "Target: '$([KeyTyper]::WindowTitle($target))', layout $($layout.Name), delay $delay ms"
+        $r = [KeyTyper]::TypeText($clipText, $layout.Hkl, $delay, $target)
+        if ($r.Aborted) { Write-UiLog "Typing aborted after $($r.Typed) chars: $($r.Aborted)." }
+        else            { Write-UiLog "Done typing ($($r.Typed) chars)." }
+        if ($r.Unicode) {
+            Write-UiLog "$($r.Unicode) chars not on this layout, sent as Unicode (may fail in VM/remote consoles): $($r.Missing)"
+        }
     } catch {
         Write-UiLog "Typing aborted: $($_.Exception.Message)"
     } finally {
+        if ($layout -and $layout.Unload) { [KeyTyper]::UnloadLayout($layout.Hkl) | Out-Null }
         $form.WindowState = 'Normal'
         $form.Activate()
     }
@@ -558,7 +723,7 @@ function New-TextCopyForm {
     )
 
     $form               = New-Object System.Windows.Forms.Form
-    $form.Text          = "TextCopyHelper"
+    $form.Text          = "TextCopyHelper v$VERSION"
     $form.StartPosition = "CenterScreen"
     $form.TopMost       = $true
     $form.MinimumSize   = New-Object System.Drawing.Size(360, 320)
@@ -607,7 +772,51 @@ function New-TextCopyForm {
     $toolbar.Controls.Add($addBtn)
     $toolbar.Controls.Add($typeBtn)
 
+    # Tipp-Optionen: Layout (Spalte wächst mit der Fensterbreite) und Verzögerung
+    $typeBar              = New-Object System.Windows.Forms.TableLayoutPanel
+    $typeBar.Dock         = 'Bottom'
+    $typeBar.AutoSize     = $true
+    $typeBar.AutoSizeMode = 'GrowAndShrink'
+    $typeBar.ColumnCount  = 4
+    $typeBar.RowCount     = 1
+    $typeBar.Padding      = New-Object System.Windows.Forms.Padding(5, 0, 5, 4)
+    [void]$typeBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$typeBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$typeBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$typeBar.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
+    $layoutLabel          = New-Object System.Windows.Forms.Label
+    $layoutLabel.Text     = "Layout"
+    $layoutLabel.AutoSize = $true
+    $layoutLabel.Anchor   = 'Left'
+
+    $layoutBox               = New-Object System.Windows.Forms.ComboBox
+    $layoutBox.DropDownStyle = 'DropDownList'
+    $layoutBox.DisplayMember = 'Name'
+    $layoutBox.Anchor        = 'Left,Right'
+    $layoutBox.MinimumSize   = New-Object System.Drawing.Size(80, 0)
+    $layoutBox.DropDownWidth = 280
+    $tip.SetToolTip($layoutBox, "Keyboard layout of the TARGET. Auto uses the layout of the window that has the focus when typing starts. For VM/remote consoles choose the layout used inside the remote system.")
+
+    $delayLabel          = New-Object System.Windows.Forms.Label
+    $delayLabel.Text     = "Delay ms"
+    $delayLabel.AutoSize = $true
+    $delayLabel.Anchor   = 'Left'
+
+    $delayBox         = New-Object System.Windows.Forms.NumericUpDown
+    $delayBox.Minimum = 0
+    $delayBox.Maximum = $TYPE_DELAY_MAX
+    $delayBox.Width   = 55
+    $delayBox.Anchor  = 'Left'
+    $tip.SetToolTip($delayBox, "Pause between characters and between Shift/AltGr and the key. Raise it if a remote console drops Shift or AltGr.")
+
+    $typeBar.Controls.Add($layoutLabel, 0, 0)
+    $typeBar.Controls.Add($layoutBox,   1, 0)
+    $typeBar.Controls.Add($delayLabel,  2, 0)
+    $typeBar.Controls.Add($delayBox,    3, 0)
+
     $split.Panel1.Controls.Add($toolbar)
+    $split.Panel1.Controls.Add($typeBar)   # zuletzt hinzugefügt = zuerst angedockt = ganz unten
     $split.Panel1.Controls.Add($linesHost)
     $linesHost.BringToFront()   # Fill wird nach Bottom angedockt
 
@@ -672,6 +881,9 @@ function New-TextCopyForm {
         Preview   = $richBox
         Log       = $logBox
         ToolTip   = $tip
+        TypeBar   = $typeBar
+        LayoutBox = $layoutBox
+        DelayBox  = $delayBox
         OrigRtf   = $RtfContent
         OrigHtml  = $HtmlContent
         OrigPlain = $PlainContent
@@ -695,6 +907,19 @@ function New-TextCopyForm {
     }
     $richBox.Modified = $false
 
+    # ── Tipp-Einstellungen aus der Registry, Änderungen sofort zurückschreiben ─
+    $savedKey = [string](Get-Setting 'TypingLayout' 'auto')
+    foreach ($c in (Get-LayoutChoices)) {
+        $idx = $layoutBox.Items.Add($c)
+        if ($c.Key -eq $savedKey) { $layoutBox.SelectedIndex = $idx }
+    }
+    if ($layoutBox.SelectedIndex -lt 0) { $layoutBox.SelectedIndex = 0 }   # gespeichertes Layout nicht mehr vorhanden → Auto
+    $delay = [int](Get-Setting 'TypingDelayMs' $TYPE_DELAY_MS)
+    $delayBox.Value = [Math]::Max(0, [Math]::Min($TYPE_DELAY_MAX, $delay))
+
+    $layoutBox.Add_SelectedIndexChanged({ Set-Setting 'TypingLayout' $script:ui.LayoutBox.SelectedItem.Key })
+    $delayBox.Add_ValueChanged({ Set-Setting 'TypingDelayMs' ([int]$script:ui.DelayBox.Value) })
+
     # ── Zeilen ────────────────────────────────────────────────────────────────
     $lines = Split-ClipboardLines $PlainContent
     $linesHost.SuspendLayout()
@@ -708,14 +933,15 @@ function New-TextCopyForm {
     # ── Starthöhe: so hoch wie nötig, höchstens MAX_HEIGHT_PCT des Bildschirms ─
     $rowHeight   = (Get-LineRows)[0].PreferredSize.Height
     $linesHeight = $shown * $rowHeight + $linesHost.Padding.Vertical
-    $wanted      = $linesHeight + $toolbar.PreferredSize.Height + $split.SplitterWidth + $PREVIEW_HEIGHT + $LOG_HEIGHT
+    $wanted      = $linesHeight + $toolbar.PreferredSize.Height + $typeBar.PreferredSize.Height + $split.SplitterWidth + $PREVIEW_HEIGHT + $LOG_HEIGHT
     $workArea    = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     $maxClient   = [int]($workArea.Height * $MAX_HEIGHT_PCT)
     $form.ClientSize = New-Object System.Drawing.Size($FORM_WIDTH, [Math]::Min($wanted, $maxClient))
 
     $form.Add_Load({
         $s = $script:ui.Split
-        $s.Panel1MinSize    = 60
+        # Knopfleisten + mindestens eine sichtbare Zeile
+        $s.Panel1MinSize    = $script:ui.Toolbar.Height + $script:ui.TypeBar.Height + 30
         $s.Panel2MinSize    = 70
         $s.SplitterDistance = [Math]::Max($s.Panel1MinSize, $s.Height - $s.SplitterWidth - $PREVIEW_HEIGHT)
     })

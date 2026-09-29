@@ -5,7 +5,9 @@
 #   powershell.exe -STA -ExecutionPolicy Bypass -File .\tests\TextCopyHelper.Tests.ps1
 param([string]$ScriptPath = (Join-Path $PSScriptRoot "..\TextCopyHelper.ps1"))
 
-$TextCopyHelperNoRun = $true
+$TextCopyHelperNoRun   = $true
+$TextCopyHelperRegPath = 'HKCU:\Software\ps-tools\TextCopyHelper-Test'   # echte Einstellungen bleiben unberührt
+Remove-Item $TextCopyHelperRegPath -Recurse -ErrorAction SilentlyContinue
 . $ScriptPath
 
 $script:failed = 0
@@ -35,6 +37,10 @@ function Assert-NoHScroll([string]$When) {
         Check "$When - keine Zeile breiter als der Client" ($tooWide.Count -eq 0) "client=$($lh.ClientSize.Width) row=$($rows[0].Width)"
         $lastBtn = $rows[0].GetControlFromPosition(2, 0)
         Check "$When - Zeilen-Knöpfe vollständig sichtbar" ($lastBtn.Right -le $rows[0].ClientSize.Width) "btnRight=$($lastBtn.Right) rowWidth=$($rows[0].ClientSize.Width)"
+    }
+    foreach ($bar in $script:ui.Toolbar, $script:ui.TypeBar) {
+        $cut = @($bar.Controls | Where-Object { $_.Right -gt $bar.ClientSize.Width -or $_.Width -le 0 })
+        Check "$When - $($bar.GetType().Name) vollständig sichtbar" ($cut.Count -eq 0) (($cut | ForEach-Object { "$($_.GetType().Name) right=$($_.Right)" }) -join ', ')
     }
 }
 
@@ -98,6 +104,32 @@ foreach ($w in 360, 800, 420) {
 $f.Height = $maxClient + 200; [System.Windows.Forms.Application]::DoEvents()
 Check "Größerziehen vergrößert den Zeilenbereich" ($script:ui.Split.Panel1.Height -gt 200) "panel1=$($script:ui.Split.Panel1.Height)"
 $f.Close(); $f.Dispose()
+
+# ── 4. Tipp-Einstellungen: UI ↔ Registry ─────────────────────────────────────
+Write-Host "Einstellungen"
+$f = Open-TestForm ""
+Check "Titel trägt die Version" ($f.Text -eq "TextCopyHelper v$VERSION") $f.Text
+Check "Standard: Layout Auto" ($script:ui.LayoutBox.SelectedItem.Key -eq 'auto')
+Check "Standard: Verzögerung $TYPE_DELAY_MS ms" ($script:ui.DelayBox.Value -eq $TYPE_DELAY_MS)
+Check "Standard schreibt nichts in die Registry" (-not (Test-Path $TextCopyHelperRegPath))
+$usIdx = -1
+for ($i = 0; $i -lt $script:ui.LayoutBox.Items.Count; $i++) { if ($script:ui.LayoutBox.Items[$i].Key -match '0409$|00000409$') { $usIdx = $i; break } }
+Check "US-Layout steht zur Auswahl" ($usIdx -ge 0)
+$script:ui.LayoutBox.SelectedIndex = $usIdx
+$script:ui.DelayBox.Value = 42
+$chosen = $script:ui.LayoutBox.SelectedItem.Key
+$f.Close(); $f.Dispose()
+Check "Layout gespeichert" ((Get-ItemProperty $TextCopyHelperRegPath).TypingLayout -eq $chosen)
+Check "Verzögerung gespeichert" ((Get-ItemProperty $TextCopyHelperRegPath).TypingDelayMs -eq 42)
+$f = Open-TestForm ""
+Check "Layout beim nächsten Start wieder gewählt" ($script:ui.LayoutBox.SelectedItem.Key -eq $chosen) $script:ui.LayoutBox.SelectedItem.Key
+Check "Verzögerung beim nächsten Start wieder gesetzt" ($script:ui.DelayBox.Value -eq 42)
+$f.Close(); $f.Dispose()
+Set-ItemProperty $TextCopyHelperRegPath -Name TypingLayout -Value 'hkl:DEADBEEF'
+$f = Open-TestForm ""
+Check "unbekanntes gespeichertes Layout fällt auf Auto zurück" ($script:ui.LayoutBox.SelectedItem.Key -eq 'auto')
+$f.Close(); $f.Dispose()
+Remove-Item $TextCopyHelperRegPath -Recurse -ErrorAction SilentlyContinue
 
 Write-Host ""
 if ($script:failed) { Write-Host "$script:failed Check(s) fehlgeschlagen." -ForegroundColor Red; exit 1 }
