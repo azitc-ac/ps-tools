@@ -1,12 +1,13 @@
 # ps-tools
 
-Kleine Windows-Werkzeuge für den Alltag. Aktuell zwei PowerShell-Skripte mit
+Kleine Windows-Werkzeuge für den Alltag. Aktuell drei PowerShell-Skripte mit
 WinForms-Oberfläche:
 
 | Skript | Zweck |
 |---|---|
 | [`unblock-Files.ps1`](#unblock-filesps1) | Entfernt den `Zone.Identifier`-Stream von blockierten Dateien |
 | [`uninstall-Apps.ps1`](#uninstall-appsps1) | Listet installierte Programme auf und deinstalliert mehrere davon still |
+| [`TextCopyHelper.ps1`](#textcopyhelperps1) | Zerlegt den Clipboard-Inhalt in Zeilen mit Copy-Knöpfen und tippt ihn bei Bedarf als Tastatureingabe |
 
 ---
 
@@ -174,3 +175,52 @@ Der Exitcode des Uninstallers landet als Status in der Liste:
 - Windows, PowerShell 5.1 oder höher, gestartet im **STA**-Modus
   (`powershell.exe` tut das von sich aus)
 - Administratorrechte für maschinenweit installierte Programme
+
+---
+
+## TextCopyHelper.ps1
+
+Liest beim Start das Clipboard und zeigt jede Zeile in einem eigenen Feld mit
+**Copy**-Knopf – praktisch, um Benutzername, Kennwort, Pfade o. Ä. einzeln in
+Anwendungen zu übertragen.
+
+### Features
+
+- **Eine Zeile pro Feld** mit *Copy* und *-* (Zeile entfernen). Leeres
+  Clipboard ergibt vier leere Zeilen zum Selbstausfüllen.
+- **+ Knopf** fügt eine leere Zeile an, scrollt hin und setzt den Cursor hinein.
+- **Paste clipboard as keyboard input**: minimiert das Fenster, wartet 2 s und
+  tippt den aktuellen Clipboard-Inhalt per Scancode – für Konsolen, VMs und
+  Remote-Sitzungen, in denen Einfügen nicht geht.
+- **Clipboard preview** mit Formatierung (RTF, z. B. aus PowerShell ISE):
+  *Copy text* kopiert reinen Text, *Copy RTF* kopiert RTF + HTML + Text, damit
+  auch OneNote die Farben übernimmt. Wurde die Vorschau bearbeitet, wird der
+  bearbeitete Inhalt kopiert.
+
+### Layout
+
+- Starthöhe nach Zeilenzahl, höchstens **60 % der Bildschirmhöhe**; das Fenster
+  lässt sich größer ziehen, der Zeilenbereich wächst mit.
+- Der Zeilenbereich scrollt nur **vertikal** – die Felder passen sich der
+  Fensterbreite an, horizontale Scrollbalken entstehen nicht.
+- Zwischen Zeilen und Vorschau sitzt ein verschiebbarer Splitter.
+- Mehr als 200 Zeilen im Clipboard: die ersten 200 als Felder, der Rest nur in
+  der Vorschau (Hinweis im Protokoll).
+
+### Verwendung
+
+```powershell
+powershell.exe -STA -ExecutionPolicy Bypass -File .\TextCopyHelper.ps1
+```
+
+### Tests
+
+```powershell
+powershell.exe -STA -ExecutionPolicy Bypass -File .\tests\TextCopyHelper.Tests.ps1
+```
+
+Baut das Fenster unsichtbar auf und prüft u. a.: keine horizontalen
+Scrollbalken (bei 4 und 300 Zeilen, einer 3000-Zeichen-Zeile, nach
+Minimieren/Wiederherstellen und bei Breiten von 360–800 px), begrenzte
+Starthöhe, Reihenfolge der Zeilen sowie *+* und *-*. Das Clipboard bleibt
+dabei unberührt.
