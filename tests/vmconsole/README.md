@@ -1,5 +1,15 @@
 # Test: TextCopyHelper in einer VMware-Konsole
 
+> **Befund (30.09.2026): Mit VMware Workstation funktioniert dieser Test nicht.**
+> Workstation 26H1u1 verwirft Tastendrücke, die ein Programm einspeist
+> (`SendInput`), vollständig, auch wenn die Konsole die Eingabe übernommen
+> hat. Echte Tastendrücke kommen an. Gemessen im Windows 365 Cloud PC (drei
+> Durchläufe, zwei Eingabemethoden) und auf einem physischen x64-Surface
+> (`grabbed-typing-test.cmd`: 22 Zeichen gesendet, 0 angekommen).
+> VMRC verhält sich anders: Dort funktioniert TextCopyHelper im Alltag.
+> Das Prüfskript im Gast (`iso/check.sh`) bleibt nutzbar, z. B. mit VMRC
+> gegen einen ESXi.
+
 Prüft, ob „Paste clipboard as keyboard input“ in einer VMware-Konsole Zeichen
 für Zeichen korrekt ankommt – vor allem Shift- und AltGr-Zeichen wie
 `$ [ ] { } \ | @ ~`. Im Gast läuft eine verdeckte Abfrage wie bei einem
